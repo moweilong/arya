@@ -1,0 +1,310 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+
+	"github.com/cloudwego/eino/schema"
+	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+
+	"github.com/moweilong/arya/agent"
+	"github.com/moweilong/arya/model"
+	"github.com/moweilong/arya/pkg/feishu"
+	"github.com/moweilong/arya/pkg/feishu/card"
+)
+
+// 流程：
+// 1. 用户发送消息
+// 2. 飞书接收到消息，创建卡片实体，发送卡片消息（消息内容正在处理中）
+// 3. 同步调用 AI Agent，接收 Agent 流式输出，更新卡片实体，推送更新
+
+// Config 应用配置
+type Config struct {
+	// 飞书配置
+	FeishuAppID     string
+	FeishuAppSecret string
+
+	// AI 模型配置
+	ModelPlatform string
+	ModelBaseURL  string
+	ModelAPIKey   string
+	ModelName     string
+}
+
+// App 应用实例
+type App struct {
+	config  *Config
+	feishu  *feishu.Client
+	agent   *agent.Agent
+	schemas map[string]string // messageID -> cardID 映射
+	mu      sync.RWMutex
+}
+
+func main() {
+	ctx := context.Background()
+
+	// 应用配置
+	cfg := &Config{
+		FeishuAppID:     "cli_a95ed4d22138dbde",
+		FeishuAppSecret: "jkVzBpNq9YEGd2pPmu2x3f1pHNI8UELh",
+		ModelPlatform:   "qwen",
+		ModelBaseURL:    "http://10.82.21.25:38444/apiaccess/1774592699_qwen3-5-0327/v1",
+		ModelAPIKey:     "2000|sk-kRU8qibVEpKUSLWRt7WdHvAV6P3M0QAf",
+		ModelName:       "qwen3-5-122B",
+	}
+
+	// 创建应用实例
+	app, err := NewApp(cfg)
+	if err != nil {
+		log.Fatalf("创建应用失败: %v", err)
+	}
+
+	// 注册事件处理器
+	app.RegisterEventHandlers()
+
+	// 启动长连接
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	log.Println("启动飞书长连接...")
+	if err := app.feishu.StartStream(ctx); err != nil {
+		log.Fatalf("启动长连接失败: %v", err)
+	}
+}
+
+// NewApp 创建应用实例
+func NewApp(cfg *Config) (*App, error) {
+	// 创建飞书客户端
+	feishuClient := feishu.NewClient(&feishu.Config{
+		AppID:     cfg.FeishuAppID,
+		AppSecret: cfg.FeishuAppSecret,
+		Debug:     false,
+	})
+
+	// 创建聊天模型
+	cm, err := model.NewChatModel(
+		model.WithPlatform(cfg.ModelPlatform),
+		model.WithBaseUrl(cfg.ModelBaseURL),
+		model.WithAPIKey(cfg.ModelAPIKey),
+		model.WithModel(cfg.ModelName),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("创建聊天模型失败: %w", err)
+	}
+
+	// 创建记忆管理器
+	// memoryStore := memoryStorage.NewMemoryStore()
+	// memoryManager, err := memory.NewMemoryManager(cm, memoryStore, &memory.MemoryConfig{
+	// 	MemoryLimit: 10,
+	// 	Retrieval:   memory.RetrievalLastN,
+	// })
+	// if err != nil {
+	// 	return nil, fmt.Errorf("创建记忆管理器失败: %w", err)
+	// }
+
+	// 创建 Agent
+	ag, err := agent.NewAgent(context.Background(), cm,
+		// agent.WithMemoryManager(memoryManager),
+		agent.WithSystemPrompt("你是一个友好的 AI 助手，请用简洁的语言回答用户的问题。"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("创建 Agent 失败: %w", err)
+	}
+
+	return &App{
+		config:  cfg,
+		feishu:  feishuClient,
+		agent:   ag,
+		schemas: make(map[string]string),
+	}, nil
+}
+
+// RegisterEventHandlers 注册事件处理器
+func (app *App) RegisterEventHandlers() {
+	app.feishu.RegisterEvents(&feishu.EventConfig{
+		OnMessageReceive:    app.handleMessageReceive,
+		CustomEventHandlers: map[string]func(ctx context.Context, event *larkevent.EventReq) error{
+			// 可添加其他自定义事件处理
+		},
+	})
+}
+
+// handleMessageReceive 处理接收到的消息
+func (app *App) handleMessageReceive(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+	// 解析消息内容
+	msgContent := parseMessageContent(event.Event.Message.Content)
+	if msgContent == "" {
+		return nil
+	}
+
+	// 获取发送者信息
+	senderID := getSenderID(event.Event.Sender)
+	if senderID == "" {
+		return nil
+	}
+
+	// 获取群聊ID
+	chatID := getChatID(event.Event.Message)
+
+	log.Printf("收到消息 - 发送者: %s, 内容: %s", senderID, msgContent)
+
+	// 异步处理消息，避免阻塞事件处理
+	go app.processMessage(chatID, msgContent)
+
+	return nil
+}
+
+// processMessage 处理消息并响应
+func (app *App) processMessage(chatID, content string) {
+	ctx := context.Background()
+
+	// 1. 创建卡片实体
+	c := card.NewBuilder().
+		WithTitle("AI 助手").
+		WithStreamingMode(true).
+		AddMarkdownElement("markdown", "正在思考...").
+		Build()
+	cardID, err := app.feishu.Card().Create(ctx, c)
+	if err != nil {
+		log.Printf("创建卡片失败: %v", err)
+		return
+	}
+
+	// 2. 发送卡片消息给用户
+	messageID, err := app.feishu.Message().SendCardToChat(ctx, chatID, buildCardContent(cardID))
+	if err != nil {
+		log.Printf("发送卡片消息失败: %v", err)
+		return
+	}
+
+	// 保存映射关系
+	app.mu.Lock()
+	app.schemas[messageID] = cardID
+	app.mu.Unlock()
+
+	log.Printf("发送卡片成功 - messageID: %s, cardID: %s", messageID, cardID)
+
+	// 3. 调用 AI Agent 流式输出
+	app.streamAIResponse(ctx, cardID, content)
+}
+
+// streamAIResponse 流式获取 AI 响应并更新卡片
+func (app *App) streamAIResponse(ctx context.Context, cardID, userMessage string) {
+	// 创建流式请求
+	stream, err := app.agent.Stream(ctx, []*schema.Message{
+		schema.UserMessage(userMessage),
+	})
+	if err != nil {
+		log.Printf("创建 AI 流式请求失败: %v", err)
+		app.updateCardWithError(ctx, cardID, fmt.Sprintf("请求失败: %v", err))
+		return
+	}
+
+	// 收集完整响应
+	var fullContent strings.Builder
+	var lastContent string
+
+	// 读取流式响应
+	for {
+		chunk, err := stream.Recv()
+		if err != nil {
+			break
+		}
+
+		fullContent.WriteString(chunk.Content)
+
+		// 节流更新：避免频繁更新卡片
+		currentContent := fullContent.String()
+		if len(currentContent)-len(lastContent) > 10 || lastContent == "" {
+			lastContent = currentContent
+			if err := app.feishu.Card().UpdateContent(ctx, cardID, currentContent); err != nil {
+				log.Printf("更新卡片失败: %v", err)
+			}
+		}
+	}
+
+	// 最终更新
+	finalContent := fullContent.String()
+	if finalContent != lastContent {
+		if err := app.feishu.Card().UpdateContent(ctx, cardID, finalContent); err != nil {
+			log.Printf("最终更新卡片失败: %v", err)
+		}
+	}
+
+	log.Printf("AI 响应完成 - cardID: %s", cardID)
+}
+
+// updateCardWithError 更新卡片显示错误信息
+func (app *App) updateCardWithError(ctx context.Context, cardID, errMsg string) {
+	_ = app.feishu.Card().UpdateContent(ctx, cardID, fmt.Sprintf("❌ %s", errMsg))
+}
+
+// parseMessageContent 解析消息内容
+func parseMessageContent(content *string) string {
+	if content == nil || *content == "" {
+		return ""
+	}
+
+	// 尝试解析 JSON 格式的消息内容
+	var msg struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(*content), &msg); err == nil {
+		return msg.Text
+	}
+
+	// 如果不是 JSON，直接返回原文
+	return *content
+}
+
+// getSenderID 获取发送者 ID
+func getSenderID(sender *larkim.EventSender) string {
+	if sender == nil {
+		return ""
+	}
+
+	fmt.Printf("发送人：%s,%s,%s", *sender.SenderId.OpenId, *sender.SenderId.UnionId, *sender.SenderId.UserId)
+
+	// 优先使用 Open ID
+	if sender.SenderId != nil && sender.SenderId.OpenId != nil {
+		return *sender.SenderId.OpenId
+	}
+
+	// 其次使用 User ID
+	if sender.SenderId != nil && sender.SenderId.UserId != nil {
+		return *sender.SenderId.UserId
+	}
+
+	return ""
+}
+
+// getChatID 获取群聊ID
+func getChatID(msg *larkim.EventMessage) string {
+	if msg == nil {
+		return ""
+	}
+
+	if msg.ChatId != nil {
+		return *msg.ChatId
+	}
+	return ""
+}
+
+// buildCardContent 构建卡片内容
+func buildCardContent(cardID string) string {
+	// 构建卡片 JSON，引用已创建的卡片实体
+	cardData := map[string]interface{}{
+		"type": "card",
+		"data": map[string]interface{}{
+			"card_id": cardID,
+		},
+	}
+
+	jsonBytes, _ := json.Marshal(cardData)
+	return string(jsonBytes)
+}
