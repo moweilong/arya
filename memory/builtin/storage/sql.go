@@ -31,7 +31,7 @@ func NewGormStorage(db *gorm.DB) (*SQLStore, error) {
 
 	store := &SQLStore{
 		db:                db,
-		tableNameProvider: NewTableNameProvider("aggo_mem"), // 默认前缀
+		tableNameProvider: NewTableNameProvider("arya_mem"), // 默认前缀
 	}
 
 	return store, nil

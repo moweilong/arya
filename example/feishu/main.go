@@ -8,12 +8,21 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	schemaGrom "gorm.io/gorm/schema"
 
-	"github.com/moweilong/arya/agent"
-	"github.com/moweilong/arya/model"
+	aryaAgent "github.com/moweilong/arya/agent"
+	"github.com/moweilong/arya/memory"
+	"github.com/moweilong/arya/memory/builtin"
+	"github.com/moweilong/arya/memory/builtin/storage"
+	aryaModel "github.com/moweilong/arya/model"
 	"github.com/moweilong/arya/pkg/feishu"
 	"github.com/moweilong/arya/pkg/feishu/card"
 )
@@ -34,15 +43,19 @@ type Config struct {
 	ModelBaseURL  string
 	ModelAPIKey   string
 	ModelName     string
+
+	// 记忆存储配置
+	MemoryDSN string // MySQL 数据库连接字符串，如: user:password@tcp(127.0.0.1:3306)/dbname
 }
 
 // App 应用实例
 type App struct {
-	config  *Config
-	feishu  *feishu.Client
-	agent   *agent.Agent
-	schemas map[string]string // messageID -> cardID 映射
-	mu      sync.RWMutex
+	config   *Config
+	feishu   *feishu.Client
+	agent    adk.Agent
+	provider memory.MemoryProvider // 记忆提供者
+	schemas  map[string]string     // messageID -> cardID 映射
+	mu       sync.RWMutex
 }
 
 func main() {
@@ -56,6 +69,7 @@ func main() {
 		ModelBaseURL:    "http://10.82.21.25:38444/apiaccess/1774592699_qwen3-5-0327/v1",
 		ModelAPIKey:     "2000|sk-kRU8qibVEpKUSLWRt7WdHvAV6P3M0QAf",
 		ModelName:       "qwen3-5-122B",
+		MemoryDSN:       "arya:123456@tcp(127.0.0.1:3306)/arya",
 	}
 
 	// 创建应用实例
@@ -63,6 +77,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("创建应用失败: %v", err)
 	}
+	defer app.Close() // 确保资源释放
 
 	// 注册事件处理器
 	app.RegisterEventHandlers()
@@ -77,51 +92,112 @@ func main() {
 	}
 }
 
-// NewApp 创建应用实例
 func NewApp(cfg *Config) (*App, error) {
-	// 创建飞书客户端
+	ctx := context.Background()
+
 	feishuClient := feishu.NewClient(&feishu.Config{
 		AppID:     cfg.FeishuAppID,
 		AppSecret: cfg.FeishuAppSecret,
 		Debug:     false,
 	})
 
-	// 创建聊天模型
-	cm, err := model.NewChatModel(
-		model.WithPlatform(cfg.ModelPlatform),
-		model.WithBaseUrl(cfg.ModelBaseURL),
-		model.WithAPIKey(cfg.ModelAPIKey),
-		model.WithModel(cfg.ModelName),
+	cm, err := aryaModel.NewChatModel(ctx,
+		aryaModel.WithPlatform(cfg.ModelPlatform),
+		aryaModel.WithBaseUrl(cfg.ModelBaseURL),
+		aryaModel.WithAPIKey(cfg.ModelAPIKey),
+		aryaModel.WithModel(cfg.ModelName),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("创建聊天模型失败: %w", err)
+		return nil, fmt.Errorf("创建大语言模型失败: %w", err)
 	}
 
-	// 创建记忆管理器
-	// memoryStore := memoryStorage.NewMemoryStore()
-	// memoryManager, err := memory.NewMemoryManager(cm, memoryStore, &memory.MemoryConfig{
-	// 	MemoryLimit: 10,
-	// 	Retrieval:   memory.RetrievalLastN,
-	// })
-	// if err != nil {
-	// 	return nil, fmt.Errorf("创建记忆管理器失败: %w", err)
-	// }
-
-	// 创建 Agent
-	ag, err := agent.NewAgent(context.Background(), cm,
-		// agent.WithMemoryManager(memoryManager),
-		agent.WithSystemPrompt("你是一个友好的 AI 助手，请用简洁的语言回答用户的问题。"),
-	)
+	// 创建记忆存储
+	provider, err := createMemoryProvider(cm, cfg.MemoryDSN)
 	if err != nil {
-		return nil, fmt.Errorf("创建 Agent 失败: %w", err)
+		return nil, fmt.Errorf("创建记忆存储失败: %w", err)
+	}
+
+	// 创建 Agent（带记忆功能）
+	ag, err := aryaAgent.NewAgentBuilder(cm).
+		WithInstruction("你是一名28岁的厦门女孩,名叫mary,是一名短视频剪辑师，主要剪辑电影类。喜欢养狗，家里有一只金毛，它叫小黄。喜欢宅在家里刷剧。不喜欢吃水果。性格内向高冷，别人不问的时候，一般都不回答自己的信息").
+		WithMemory(provider).
+		Build(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("创建 agent 失败: %w", err)
 	}
 
 	return &App{
-		config:  cfg,
-		feishu:  feishuClient,
-		agent:   ag,
-		schemas: make(map[string]string),
+		config:   cfg,
+		feishu:   feishuClient,
+		agent:    ag,
+		provider: provider,
+		schemas:  make(map[string]string),
 	}, nil
+}
+
+// createMemoryProvider 创建记忆提供者
+func createMemoryProvider(cm model.ToolCallingChatModel, dsn string) (memory.MemoryProvider, error) {
+	// 使用 MySQL 存储
+	gormDB, err := newMysqlGorm(dsn, logger.Silent)
+	if err != nil {
+		return nil, fmt.Errorf("连接数据库失败: %w", err)
+	}
+
+	s, err := storage.NewGormStorage(gormDB)
+	if err != nil {
+		return nil, fmt.Errorf("创建存储失败: %w", err)
+	}
+
+	provider, err := memory.GlobalRegistry().CreateProvider("builtin", &builtin.ProviderConfig{
+		ChatModel: cm,
+		Storage:   s,
+		MemoryConfig: &builtin.MemoryConfig{
+			EnableSessionSummary: true,
+			EnableUserMemories:   true,
+			MemoryLimit:          20,
+			Retrieval:            builtin.RetrievalLastN,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建记忆提供者失败: %w", err)
+	}
+
+	return provider, nil
+}
+
+// newMysqlGorm 创建 MySQL GORM 连接
+func newMysqlGorm(source string, logLevel logger.LogLevel) (*gorm.DB, error) {
+	if !strings.Contains(source, "parseTime") {
+		source += "?charset=utf8mb4&parseTime=True&loc=Local"
+	}
+	gdb, err := gorm.Open(mysql.Open(source), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		NamingStrategy: schemaGrom.NamingStrategy{
+			SingularTable: true,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 配置 GORM 日志
+	var gormLogger logger.Interface
+	if logLevel > 0 {
+		gormLogger = logger.Default.LogMode(logLevel)
+	} else {
+		gormLogger = logger.Default.LogMode(logger.Silent)
+	}
+
+	gdb.Logger = gormLogger
+
+	return gdb, nil
+}
+
+// Close 关闭应用资源
+func (app *App) Close() {
+	if app.provider != nil {
+		app.provider.Close()
+	}
 }
 
 // RegisterEventHandlers 注册事件处理器
@@ -151,17 +227,21 @@ func (app *App) handleMessageReceive(ctx context.Context, event *larkim.P2Messag
 	// 获取群聊ID
 	chatID := getChatID(event.Event.Message)
 
-	log.Printf("收到消息 - 发送者: %s, 内容: %s", senderID, msgContent)
+	log.Printf("收到消息 - 发送者: %s, 群聊: %s, 内容: %s", senderID, chatID, msgContent)
 
 	// 异步处理消息，避免阻塞事件处理
-	go app.processMessage(chatID, msgContent)
+	go app.processMessage(chatID, senderID, msgContent)
 
 	return nil
 }
 
 // processMessage 处理消息并响应
-func (app *App) processMessage(chatID, content string) {
+// sessionID 用于标识对话会话，这里使用 chatID + senderID 作为会话标识，确保同一用户在同一群聊中的对话历史连续
+func (app *App) processMessage(chatID, senderID, content string) {
 	ctx := context.Background()
+
+	// 生成会话 ID：同一用户在同一群聊中使用相同会话
+	sessionID := fmt.Sprintf("%s_%s", chatID, senderID)
 
 	// 1. 创建卡片实体
 	c := card.NewBuilder().
@@ -189,21 +269,20 @@ func (app *App) processMessage(chatID, content string) {
 
 	log.Printf("发送卡片成功 - messageID: %s, cardID: %s", messageID, cardID)
 
-	// 3. 调用 AI Agent 流式输出
-	app.streamAIResponse(ctx, cardID, content)
+	// 3. 调用 AI Agent 流式输出（带会话记忆）
+	app.streamAIResponse(ctx, cardID, senderID, sessionID, content)
 }
 
 // streamAIResponse 流式获取 AI 响应并更新卡片
-func (app *App) streamAIResponse(ctx context.Context, cardID, userMessage string) {
-	// 创建流式请求
-	stream, err := app.agent.Stream(ctx, []*schema.Message{
-		schema.UserMessage(userMessage),
-	})
-	if err != nil {
-		log.Printf("创建 AI 流式请求失败: %v", err)
-		app.updateCardWithError(ctx, cardID, fmt.Sprintf("请求失败: %v", err))
-		return
-	}
+func (app *App) streamAIResponse(ctx context.Context, cardID, userID, sessionID, userMessage string) {
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: app.agent, EnableStreaming: true})
+
+	// 传入会话信息，启用记忆功能
+	stream := runner.Run(ctx, []adk.Message{schema.UserMessage(userMessage)},
+		adk.WithSessionValues(map[string]any{
+			"userID":    userID,
+			"sessionID": sessionID,
+		}))
 
 	// 收集完整响应
 	var fullContent strings.Builder
@@ -211,19 +290,28 @@ func (app *App) streamAIResponse(ctx context.Context, cardID, userMessage string
 
 	// 读取流式响应
 	for {
-		chunk, err := stream.Recv()
-		if err != nil {
+		event, ok := stream.Next()
+		if !ok {
 			break
 		}
 
-		fullContent.WriteString(chunk.Content)
+		if event.Err != nil {
+			log.Printf("AI 响应错误: %v", event.Err)
+			break
+		}
 
-		// 节流更新：避免频繁更新卡片
-		currentContent := fullContent.String()
-		if len(currentContent)-len(lastContent) > 10 || lastContent == "" {
-			lastContent = currentContent
-			if err := app.feishu.Card().UpdateContent(ctx, cardID, currentContent); err != nil {
-				log.Printf("更新卡片失败: %v", err)
+		if event.Output != nil && event.Output.MessageOutput != nil {
+			if msg, err := event.Output.MessageOutput.GetMessage(); err == nil && msg != nil {
+				fullContent.WriteString(msg.Content)
+
+				// 节流更新：避免频繁更新卡片
+				currentContent := fullContent.String()
+				if len(currentContent)-len(lastContent) > 10 || lastContent == "" {
+					lastContent = currentContent
+					if err := app.feishu.Card().UpdateContent(ctx, cardID, currentContent); err != nil {
+						log.Printf("更新卡片失败: %v", err)
+					}
+				}
 			}
 		}
 	}
@@ -236,7 +324,7 @@ func (app *App) streamAIResponse(ctx context.Context, cardID, userMessage string
 		}
 	}
 
-	log.Printf("AI 响应完成 - cardID: %s", cardID)
+	log.Printf("AI 响应完成 - cardID: %s, userID: %s, sessionID: %s", cardID, userID, sessionID)
 }
 
 // updateCardWithError 更新卡片显示错误信息

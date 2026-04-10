@@ -12,6 +12,7 @@ import (
 
 // MemoryMiddleware implements adk.ChatModelAgentMiddleware.
 // It delegates to a MemoryProvider for retrieval and memorization.
+// eino adk 中间件实现，依赖 MemoryProvider 检索和存储用户和 AI 的对话记录。
 type MemoryMiddleware struct {
 	*adk.BaseChatModelAgentMiddleware
 	provider MemoryProvider
@@ -31,7 +32,9 @@ func (m *MemoryMiddleware) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 }
 
 // BeforeModelRewriteState injects memory context before a model call.
+// 在模型调用前注入记忆上下文
 func (m *MemoryMiddleware) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
+	// 检查是否有内存提供者，没有则直接返回原始状态
 	if m.provider == nil {
 		return ctx, state, nil
 	}
@@ -44,6 +47,7 @@ func (m *MemoryMiddleware) BeforeModelRewriteState(ctx context.Context, state *a
 		return ctx, state, nil
 	}
 
+	// 检查是否已处理过，避免重复注入记忆（幂等性保护）
 	if prepared, ok := adk.GetSessionValue(ctx, m.beforeModelRewriteStateKey()); ok {
 		if done, ok := prepared.(bool); ok && done {
 			return ctx, state, nil
@@ -51,35 +55,39 @@ func (m *MemoryMiddleware) BeforeModelRewriteState(ctx context.Context, state *a
 	}
 
 	// Call provider to retrieve context
+	// 调用内存提供者检索相关记忆上下文
 	result, err := m.provider.Retrieve(ctx, &RetrieveRequest{
 		UserID:    uid,
 		SessionID: sid,
-		Messages:  state.Messages,
+		Messages:  state.Messages, // 当前对话记录，用于检索相关消息记录
 	})
 	if err != nil {
 		log.Printf("MemoryMiddleware: Retrieve failed: %v", err)
 		return ctx, state, nil
 	}
 
+	// 如果没有检索到记忆，标记已处理并返回原始状态
 	if result == nil {
 		adk.AddSessionValue(ctx, m.beforeModelRewriteStateKey(), true)
 		return ctx, state, nil
 	}
 
 	// Split state.Messages into: first system message + rest
-	var systemMsg *schema.Message
-	var restMessages []*schema.Message
+	var systemMsg *schema.Message      // 声明变量存储系统消息
+	var restMessages []*schema.Message // 声明变量存储其他消息
 	for _, msg := range state.Messages {
 		if systemMsg == nil && msg.Role == schema.System {
 			systemMsg = msg
 		} else {
-			restMessages = append(restMessages, msg)
+			restMessages = append(restMessages, msg) // 其他消息，直接添加到结果中
 		}
 	}
 
 	// Merge memory context into the system prompt content.
+	// 合并系统消息和历史消息到系统提示内容中
 	if len(result.SystemMessages) > 0 && systemMsg != nil {
 		var memoryBlock strings.Builder
+		// 遍历记忆系统消息，拼接成记忆块
 		for i, sm := range result.SystemMessages {
 			if sm.Content != "" {
 				if i > 0 {
@@ -89,6 +97,7 @@ func (m *MemoryMiddleware) BeforeModelRewriteState(ctx context.Context, state *a
 				memoryBlock.WriteString("\n")
 			}
 		}
+		// 将记忆内容追加到原系统消息后面
 		systemMsg.Content = systemMsg.Content + "\n\n" + memoryBlock.String()
 	}
 
@@ -155,6 +164,7 @@ func (m *MemoryMiddleware) AfterModelRewriteState(ctx context.Context, state *ad
 
 	if len(messagesToMemorize) > 0 {
 		go func() {
+			// 主线程中异步调用内存提供者存储记忆
 			bgCtx := context.Background()
 			if err := m.provider.Memorize(bgCtx, &MemorizeRequest{
 				UserID:    uid,
@@ -170,5 +180,5 @@ func (m *MemoryMiddleware) AfterModelRewriteState(ctx context.Context, state *ad
 }
 
 func (m *MemoryMiddleware) beforeModelRewriteStateKey() string {
-	return fmt.Sprintf("__aggo_memory_middleware_prepared_%p", m)
+	return fmt.Sprintf("__arya_memory_middleware_prepared_%p", m)
 }

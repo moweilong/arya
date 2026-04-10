@@ -1,0 +1,322 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/cloudwego/eino-ext/callbacks/langfuse"
+	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/callbacks"
+	einoModel "github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/tool"
+	toolUtils "github.com/cloudwego/eino/components/tool/utils"
+	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
+	"github.com/gookit/slog"
+	"github.com/joho/godotenv"
+
+	"github.com/moweilong/arya/model"
+	"github.com/moweilong/arya/pkg/adapter"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// 加载 .env 文件
+	if err := godotenv.Load(); err != nil {
+		slog.Warn("警告: 无法加载 .env 文件: %v", err)
+		slog.Warn("将尝试从系统环境变量读取配置")
+	}
+
+	// 初始化 Langfuse 回调处理器（用于跟踪执行情况）
+	langfuseHost := os.Getenv("LANGFUSE_BASE_URL")
+	langfusePublicKey := os.Getenv("LANGFUSE_PUBLIC_KEY")
+	langfuseSecretKey := os.Getenv("LANGFUSE_SECRET_KEY")
+	if langfuseHost != "" && langfusePublicKey != "" && langfuseSecretKey != "" {
+		cbh, _ := langfuse.NewLangfuseHandler(&langfuse.Config{
+			Host:      langfuseHost,
+			PublicKey: langfusePublicKey,
+			SecretKey: langfuseSecretKey,
+		})
+		callbacks.AppendGlobalHandlers(cbh)
+		slog.Info("✓ Langfuse 回调处理器已启用")
+	} else {
+		slog.Warn("提示: 未配置 Langfuse，跳过初始化（可在 .env 文件中配置）")
+	}
+
+	// 创建聊天模型
+	aryaPlatform := os.Getenv("ARYA_PLATFORM")
+	aryaBaseUrl := os.Getenv("ARYA_BASE_URL")
+	aryaApiKey := os.Getenv("ARYA_API_KEY")
+	aryaModel := os.Getenv("ARYA_MODEL")
+	if aryaPlatform == "" || aryaBaseUrl == "" || aryaApiKey == "" || aryaModel == "" {
+		log.Fatal("ARYA_PLATFORM, ARYA_BASE_URL, ARYA_API_KEY and ARYA_MODEL environment variables must be set")
+		return
+	}
+	cm, err := model.NewChatModel(ctx, model.WithPlatform(aryaPlatform),
+		model.WithBaseUrl(aryaBaseUrl),
+		model.WithAPIKey(aryaApiKey),
+		model.WithModel(aryaModel),
+	)
+	if err != nil {
+		log.Fatalf("new chat model fail,err:%s", err)
+		return
+	}
+
+	fmt.Println("=== ADK 多 Agent 路由架构示例 ===")
+
+	// 1. 创建三个专业子 Agent，每个配置不同的工具
+	mathAgent, err := createMathAgent(ctx, cm)
+	if err != nil {
+		log.Fatalf("创建数学助手失败: %v", err)
+	}
+
+	weatherAgent, err := createWeatherAgent(ctx, cm)
+	if err != nil {
+		log.Fatalf("创建天气助手失败: %v", err)
+	}
+
+	timeAgent, err := createTimeAgent(ctx, cm)
+	if err != nil {
+		log.Fatalf("创建时间助手失败: %v", err)
+	}
+
+	// 2. 创建主路由 Agent，它会根据问题自动选择合适的子 Agent
+	mainAgent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "智能助手",
+		Description: "我是一个智能助手，可以处理数学计算、天气查询和时间处理等各类问题",
+		Instruction: "你是一个智能路由助手。根据用户的问题类型，选择合适的专业助手来回答：" +
+			"1. 数学计算相关问题，请使用数学助手；" +
+			"2. 天气查询相关问题，请使用天气助手；" +
+			"3. 时间日期相关问题，请使用时间助手。" +
+			"请仔细理解用户问题，选择最合适的助手进行处理。",
+		Model:         cm,
+		MaxIterations: 10,
+	})
+	if err != nil {
+		log.Fatalf("创建主 Agent 失败: %v", err)
+	}
+
+	// 3. 将子 Agent 注册到主 Agent
+	routerAgent, err := adk.SetSubAgents(ctx, mainAgent, []adk.Agent{
+		adk.AgentWithOptions(ctx, mathAgent, adk.WithDisallowTransferToParent()),
+		adk.AgentWithOptions(ctx, weatherAgent, adk.WithDisallowTransferToParent()),
+		adk.AgentWithOptions(ctx, timeAgent, adk.WithDisallowTransferToParent()),
+	})
+	if err != nil {
+		log.Fatalf("设置子 Agent 失败: %v", err)
+	}
+
+	// routerAgent is already an adk.Agent, use it directly
+
+	// 4. 测试不同类型的问题，主 Agent 会自动路由到对应的子 Agent
+	testQuestions := []string{
+		"请帮我计算 123.5 + 456.8 等于多少？",
+		"北京今天的天气怎么样？",
+		"现在几点了？",
+		"如果我有 1000 元，分给 8 个人，每人能分到多少？",
+		"帮我查一下上海和深圳的天气情况",
+		"请帮我计算从 2024-01-01 到 2024-12-31 一共有多少天？",
+	}
+
+	slog.Info("开始测试多 Agent 路由功能...")
+	stream := true
+	for i, question := range testQuestions {
+		slog.Infof("\n【问题 %d】: %s\n", i+1, question)
+		ctx1 := context.Background()
+		if langfuseHost != "" {
+			// 为每个问题创建独立的 trace，主动生成id避免多个agent的执行被分在多条trace
+			ctx1 = langfuse.SetTrace(context.Background(), langfuse.WithID(uuid.NewString()))
+		}
+
+		// 直接调用 Agent 运行
+		out := routerAgent.Run(ctx1, &adk.AgentInput{
+			Messages: []adk.Message{
+				{Role: schema.User, Content: question},
+			},
+			EnableStreaming: stream,
+		})
+		idx := 0
+		for {
+			event, ok := out.Next()
+			if !ok {
+				break
+			}
+
+			if event.Err != nil {
+				slog.Error(event.Err)
+				continue
+			}
+			// 检查是否退出
+			if event.Action != nil && event.Action.Exit {
+				break
+			}
+
+			if event.Output != nil && event.Output.MessageOutput != nil {
+				if stream {
+					// 流式模式：处理 MessageStream
+					if event.Output.MessageOutput.MessageStream != nil {
+						for {
+							msg, err := event.Output.MessageOutput.MessageStream.Recv()
+							if err != nil {
+								break
+							}
+							result := adapter.MessageToOpenaiStreamResponse(msg, idx)
+							respJSON, _ := json.Marshal(result)
+							slog.Infof("stream chunk %d: %s", idx, string(respJSON))
+							idx++
+						}
+					} else if event.Output.MessageOutput.Message != nil {
+						// 单个消息，转换为流式格式
+						result := adapter.MessageToOpenaiStreamResponse(event.Output.MessageOutput.Message, idx)
+						j, _ := json.Marshal(result)
+						slog.Infof("stream message: %s", string(j))
+						idx++
+					}
+				} else {
+					// 非流式模式：直接转换 Message
+					if event.Output.MessageOutput.Message != nil {
+						result := adapter.MessageToOpenaiResponse(event.Output.MessageOutput.Message)
+						j, _ := json.Marshal(result)
+						slog.Infof("response: %s", string(j))
+					} else if event.Output.MessageOutput.MessageStream != nil {
+						// 流式消息，转换为单条消息
+						msg, err := event.Output.MessageOutput.MessageStream.Recv()
+						if err != nil {
+							continue
+						}
+						result := adapter.MessageToOpenaiResponse(msg)
+						j, _ := json.Marshal(result)
+						slog.Infof("response: %s", string(j))
+					}
+				}
+			}
+		}
+
+		//out, err := bot.Generate(ctx, []*schema.Message{
+		//	{Role: schema.User, Content: question},
+		//})
+		//if err != nil {
+		//	log.Printf("生成失败: %v", err)
+		//}
+		//
+		//fmt.Printf("【回答】: %s\n", out.Content)
+		break
+	}
+
+	fmt.Println("\n=== 测试完成 ===")
+}
+
+// createMathAgent 创建数学计算专家 Agent
+func createMathAgent(ctx context.Context, cm einoModel.ToolCallingChatModel) (adk.Agent, error) {
+	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "数学助手",
+		Description: "专业的数学计算助手，擅长进行加减乘除等各类数学运算",
+		Instruction: "你是一个专业的数学助手，擅长使用计算器工具进行精确计算。" +
+			"当用户提出数学计算问题时，请使用 calculator 工具进行准确计算，并给出清晰的答案。",
+		Model: cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: getCalculatorTools(),
+			},
+		},
+		MaxIterations: 5,
+	})
+}
+
+// createWeatherAgent 创建天气查询专家 Agent
+func createWeatherAgent(ctx context.Context, cm einoModel.ToolCallingChatModel) (adk.Agent, error) {
+	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "天气助手",
+		Description: "专业的天气查询助手，可以查询各个城市的天气情况",
+		Instruction: "你是一个专业的天气播报员，擅长使用天气工具为用户提供准确的天气信息。" +
+			"当用户询问天气时，请使用 weather_query 工具查询相关城市的天气，并以友好的方式播报给用户。",
+		Model: cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: getWeatherTools(),
+			},
+		},
+		MaxIterations: 5,
+	})
+}
+
+// createTimeAgent 创建时间处理专家 Agent
+func createTimeAgent(ctx context.Context, cm einoModel.ToolCallingChatModel) (adk.Agent, error) {
+	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:        "时间助手",
+		Description: "专业的时间处理助手，可以查询时间、格式化时间、计算时间差等",
+		Instruction: "你是一个专业的时间管理助手，擅长使用时间工具处理时间查询、格式化和计算。" +
+			"当用户询问时间相关问题时，请使用 time_tool 工具获取或处理时间信息，并给出准确的答案。",
+		Model: cm,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: getTimeTools(),
+			},
+		},
+		MaxIterations: 5,
+	})
+}
+
+// ============================================================
+// 示例工具定义（仅用于本示例）
+// ============================================================
+
+type calculatorParams struct {
+	Operation string  `json:"operation" jsonschema:"description=运算类型,required,enum=add,enum=subtract,enum=multiply,enum=divide"`
+	A         float64 `json:"a" jsonschema:"description=第一个数字,required"`
+	B         float64 `json:"b" jsonschema:"description=第二个数字,required"`
+}
+
+type weatherParams struct {
+	City string `json:"city" jsonschema:"description=要查询的城市名称,required"`
+	Date string `json:"date,omitempty" jsonschema:"description=查询日期"`
+}
+
+type timeToolParams struct {
+	Operation string `json:"operation" jsonschema:"description=操作类型,required,enum=current,enum=format,enum=diff"`
+	Format    string `json:"format,omitempty" jsonschema:"description=时间格式"`
+	Time1     string `json:"time1,omitempty" jsonschema:"description=第一个时间点"`
+	Time2     string `json:"time2,omitempty" jsonschema:"description=第二个时间点"`
+}
+
+func getCalculatorTools() []tool.BaseTool {
+	t, _ := toolUtils.InferTool("calculator", "执行基本的数学运算", func(ctx context.Context, p calculatorParams) (interface{}, error) {
+		var result float64
+		switch p.Operation {
+		case "add":
+			result = p.A + p.B
+		case "subtract":
+			result = p.A - p.B
+		case "multiply":
+			result = p.A * p.B
+		case "divide":
+			if p.B == 0 {
+				return nil, fmt.Errorf("除数不能为0")
+			}
+			result = p.A / p.B
+		default:
+			return nil, fmt.Errorf("不支持的运算类型: %s", p.Operation)
+		}
+		return map[string]interface{}{"result": result}, nil
+	})
+	return []tool.BaseTool{t}
+}
+
+func getWeatherTools() []tool.BaseTool {
+	t, _ := toolUtils.InferTool("weather_query", "查询指定城市的天气", func(ctx context.Context, p weatherParams) (interface{}, error) {
+		return map[string]interface{}{"city": p.City, "weather": "晴", "temperature": "20-28°C"}, nil
+	})
+	return []tool.BaseTool{t}
+}
+
+func getTimeTools() []tool.BaseTool {
+	t, _ := toolUtils.InferTool("time_tool", "处理时间相关操作", func(ctx context.Context, p timeToolParams) (interface{}, error) {
+		return map[string]interface{}{"operation": p.Operation, "result": "2024-01-01 00:00:00"}, nil
+	})
+	return []tool.BaseTool{t}
+}

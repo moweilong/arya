@@ -8,7 +8,7 @@ type TableNameProvider struct {
 // NewTableNameProvider creates a new table name provider with the given prefix
 func NewTableNameProvider(prefix string) *TableNameProvider {
 	if prefix == "" {
-		prefix = "aggo_mem" // default prefix
+		prefix = "arya_mem" // default prefix
 	}
 	return &TableNameProvider{tablePrefix: prefix}
 }

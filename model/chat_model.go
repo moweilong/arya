@@ -8,7 +8,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 )
 
-func NewChatModel(opts ...OptionFunc) (model.ToolCallingChatModel, error) {
+func NewChatModel(ctx context.Context, opts ...OptionFunc) (model.ToolCallingChatModel, error) {
 	o := &Options{}
 	for _, opt := range opts {
 		opt(o)
@@ -16,14 +16,14 @@ func NewChatModel(opts ...OptionFunc) (model.ToolCallingChatModel, error) {
 
 	switch o.Platform {
 	case "openai":
-		return getChatByOpenai(o)
+		return getChatByOpenai(ctx, o)
 	case "qwen":
-		return getChatByQwen(o)
+		return getChatByQwen(ctx, o)
 	}
-	return getChatByOpenai(o)
+	return getChatByOpenai(ctx, o)
 }
 
-func getChatByOpenai(o *Options) (model.ToolCallingChatModel, error) {
+func getChatByOpenai(ctx context.Context, o *Options) (model.ToolCallingChatModel, error) {
 	param := &openai.ChatModelConfig{
 		APIKey:          o.APIKey, // OpenAI API 密钥
 		BaseURL:         o.BaseUrl,
@@ -39,11 +39,11 @@ func getChatByOpenai(o *Options) (model.ToolCallingChatModel, error) {
 		param.MaxTokens = &o.MaxTokens
 	}
 
-	cm, err := openai.NewChatModel(context.Background(), param)
+	cm, err := openai.NewChatModel(ctx, param)
 	return cm, err
 }
 
-func getChatByQwen(o *Options) (model.ToolCallingChatModel, error) {
+func getChatByQwen(ctx context.Context, o *Options) (model.ToolCallingChatModel, error) {
 	param := &qwen.ChatModelConfig{
 		APIKey:         o.APIKey,
 		BaseURL:        o.BaseUrl,
@@ -55,6 +55,6 @@ func getChatByQwen(o *Options) (model.ToolCallingChatModel, error) {
 		param.MaxTokens = &o.MaxTokens
 	}
 
-	cm, err := qwen.NewChatModel(context.Background(), param)
+	cm, err := qwen.NewChatModel(ctx, param)
 	return cm, err
 }
